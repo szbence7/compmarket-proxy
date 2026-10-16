@@ -1,12 +1,20 @@
 import express from "express";
+import { Agent, fetch } from "undici";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const PROXY_SECRET = process.env.PROXY_SECRET;
 const BASE = "https://compmarket.hu/xml";
 
-// 10 perc – a teljes terméklista (type=all) simán 2-5 percig tart
-const UPSTREAM_TIMEOUT_MS = 10 * 60 * 1000;
+// 15 perc – a teljes terméklista (type=all) összeállítása a CompMarketnél 5 percnél is tovább tarthat
+const UPSTREAM_TIMEOUT_MS = 15 * 60 * 1000;
+
+// A Node beépített fetch-e 5 perc után feladja, ha nem jön válaszfejléc („fetch failed”) – ezt emeljük meg.
+const upstream = new Agent({
+  connectTimeout: 30_000,
+  headersTimeout: UPSTREAM_TIMEOUT_MS,
+  bodyTimeout: UPSTREAM_TIMEOUT_MS,
+});
 
 app.get("/health", (_, res) => res.send("ok"));
 
@@ -16,18 +24,21 @@ app.get("/cm/:file", async (req, res) => {
   }
 
   const url = `${BASE}/${req.params.file}?${new URLSearchParams(req.query).toString()}`;
+  const started = Date.now();
 
-  // Ha a Lovable oldal lezárja a kapcsolatot, szakítsuk meg az upstream fetch-et is
   const ac = new AbortController();
   const timeoutId = setTimeout(() => ac.abort(new Error("upstream timeout")), UPSTREAM_TIMEOUT_MS);
-  req.on("close", () => ac.abort(new Error("client closed")));
+  // Csak akkor szakítunk, ha a hívó tényleg bontotta a kapcsolatot (a válasz még nem ment ki teljesen).
+  res.on("close", () => {
+    if (!res.writableFinished) ac.abort(new Error("client closed"));
+  });
 
-  // A Node/Express default socket timeout ne vágja el a hosszú letöltést
   req.setTimeout(UPSTREAM_TIMEOUT_MS + 30_000);
   res.setTimeout(UPSTREAM_TIMEOUT_MS + 30_000);
 
   try {
     const r = await fetch(url, {
+      dispatcher: upstream,
       signal: ac.signal,
       headers: {
         "User-Agent": "tintakod-proxy/1.0",
@@ -36,21 +47,15 @@ app.get("/cm/:file", async (req, res) => {
       },
     });
 
-    // Fejlécek átvitele (a hop-by-hop és tömörítéssel kapcsolatosakat kihagyjuk,
-    // mert az undici már kicsomagolta a body-t)
     res.status(r.status);
-    const ct = r.headers.get("content-type") || "application/xml; charset=utf-8";
-    res.setHeader("Content-Type", ct);
-    const cl = r.headers.get("content-length");
-    if (cl) res.setHeader("Content-Length", cl);
+    res.setHeader("Content-Type", r.headers.get("content-type") || "application/xml; charset=utf-8");
+    // Content-Length szándékosan nincs: a fetch kicsomagolja a gzip-et, így az eredeti hossz nem stimmelne.
 
     if (!r.body) {
       res.end();
       return;
     }
 
-    // STREAM: nem pufferoljuk memóriában a >50 MB-os XML-t,
-    // hanem darabonként toljuk tovább a kliensnek.
     const reader = r.body.getReader();
     let bytes = 0;
     while (true) {
@@ -58,16 +63,18 @@ app.get("/cm/:file", async (req, res) => {
       if (done) break;
       bytes += value.byteLength;
       if (!res.write(Buffer.from(value))) {
-        // backpressure – várjuk meg amíg a socket lecsapolódik
         await new Promise((resolve) => res.once("drain", resolve));
       }
     }
     res.end();
-    console.log(`[cm] ${req.params.file} ${r.status} ${bytes} bytes`);
+    console.log(`[cm] ${req.params.file} ${r.status} ${bytes} bytes ${Math.round((Date.now() - started) / 1000)}s`);
   } catch (e) {
-    console.error(`[cm] ${req.params.file} FAIL:`, e?.message || e);
+    // A „fetch failed” mögötti valódi ok (pl. UND_ERR_HEADERS_TIMEOUT, ECONNRESET) a cause-ban van.
+    const cause = e?.cause ? ` (${e.cause.code || e.cause.message || e.cause})` : "";
+    const msg = `${e?.message || e}${cause}`;
+    console.error(`[cm] ${req.params.file} FAIL after ${Math.round((Date.now() - started) / 1000)}s:`, msg);
     if (!res.headersSent) {
-      res.status(502).send(`Proxy error: ${e?.message || e}`);
+      res.status(502).send(`Proxy error: ${msg}`);
     } else {
       res.end();
     }
