@@ -1,0 +1,40 @@
+name: Publish proxy image
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create container recipe
+        run: |
+          cat > Dockerfile.ci <<'EOF'
+          FROM node:22-alpine
+          WORKDIR /app
+          COPY package.json ./
+          RUN npm install --omit=dev
+          COPY server.js ./
+          ENV NODE_ENV=production PORT=3000
+          USER node
+          EXPOSE 3000
+          HEALTHCHECK CMD wget -q -O /dev/null http://127.0.0.1:3000/health || exit 1
+          CMD ["node", "server.js"]
+          EOF
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.ci
+          platforms: linux/arm64
+          push: true
+          tags: ghcr.io/szbence7/compmarket-proxy:main
